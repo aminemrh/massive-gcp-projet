@@ -21,16 +21,12 @@ Les résultats bruts (CSV) et les graphiques sont situés dans le répertoire `o
 
 ## 🚀 Installation et Reproduction
 
-1.  **Prérequis :**
-    * Google Cloud SDK installé.
-    * Python 3 installé avec les librairies : `requests`, `matplotlib`, `pandas`.
-
-2.  **Déploiement sur GCP :**
+1.  **Déploiement sur GCP :**
     ```bash
     gcloud app deploy
     ```
 
-3.  **Lancer le Benchmark complet :**
+2.  **Lancer le Benchmark complet :**
     Ce script nettoie la base, génère les données (seed) pour chaque scénario, lance les tests de charge et génère les graphiques.
     ```bash
     python benchmark.py all
