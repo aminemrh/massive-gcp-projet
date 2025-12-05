@@ -43,6 +43,7 @@ def get_timeline(user: str, limit: int = 20):
     follows = []
     if user_entity:
         follows = user_entity.get('follows', [])
+    # On ajoute l'utilisateur lui-même pour voir ses propres posts
     follows = list({*follows, user})
 
     timeline = []
@@ -57,11 +58,13 @@ def get_timeline(user: str, limit: int = 20):
         pass
     if not used_gql:
         try:
+            # Tentative de requête standard avec filtre IN
             query = client.query(kind='Post')
             query.add_filter('author', 'IN', follows)
             query.order = ['-created']
             timeline = list(query.fetch(limit=limit))
         except Exception:
+            # Fallback manuel si l'index n'est pas prêt ou erreur de requête
             posts = []
             for author in follows:
                 q = client.query(kind='Post')
@@ -72,47 +75,69 @@ def get_timeline(user: str, limit: int = 20):
     return timeline
 
 
-def seed_data(users: int = 5, posts: int = 30, follows_min: int = 1, follows_max: int = 3, prefix: str = 'user'):
-    """Crée des utilisateurs, leurs relations de suivi et des posts.
-    Retourne un dict avec les compteurs. Fait des écritures directes dans Datastore.
+def seed_data(users: int = 5, posts_per_user: int = 10, follows_count: int = 5, prefix: str = 'user'):
+    """
+    Peuple la base de données pour le benchmark.
+    - Crée 'users' utilisateurs.
+    - Chaque utilisateur suit exactement 'follows_count' autres utilisateurs.
+    - Chaque utilisateur publie exactement 'posts_per_user' messages.
     """
     user_names = [f"{prefix}{i}" for i in range(1, users + 1)]
-    created_users = 0
+    
+    # 1. Création des utilisateurs
+    # On vérifie d'abord s'ils existent pour ne pas écraser inutilement, 
+    # mais pour le seed initial c'est souvent vide.
     for name in user_names:
         key = client.key('User', name)
-        entity = client.get(key)
-        if entity is None:
+        if client.get(key) is None:
             entity = datastore.Entity(key)
             entity['follows'] = []
             client.put(entity)
-            created_users += 1
-    # Assign follows
+
+    # 2. Assignation des Follows (Fixe pour exp 3)
     for name in user_names:
         key = client.key('User', name)
         entity = client.get(key)
+        
+        # On ne se suit pas soi-même
         others = [u for u in user_names if u != name]
-        if not others:
-            continue
-        target = random.randint(min(follows_min, len(others)), min(follows_max, len(others))) if follows_max > 0 else 0
-        selection = random.sample(others, target) if target > 0 else []
-        merged = sorted(set(entity.get('follows', [])).union(selection))
-        entity['follows'] = merged
-        client.put(entity)
-    # Posts
-    created_posts = 0
+        
+        # Sélection aléatoire mais nombre FIXE
+        target = min(follows_count, len(others))
+        if target > 0:
+            # On écrase les follows existants pour garantir le nombre exact demandé par le test
+            entity['follows'] = random.sample(others, target)
+            client.put(entity)
+
+    # 3. Création des Posts (Posts PAR utilisateur)
     base_time = datetime.utcnow()
-    for i in range(posts):
-        author = random.choice(user_names)
-        p = datastore.Entity(client.key('Post'))
-        p['author'] = author
-        p['content'] = f"Seed post {i+1} by {author}"
-        p['created'] = base_time - timedelta(seconds=i)
-        client.put(p)
-        created_posts += 1
+    batch = []
+    total_posts = 0
+    
+    for name in user_names:
+        for i in range(posts_per_user):
+            p = datastore.Entity(client.key('Post'))
+            p['author'] = name
+            p['content'] = f"Benchmark post {i+1} by {name}"
+            # On étale les dates aléatoirement pour le tri
+            p['created'] = base_time - timedelta(seconds=random.randint(1, 10000))
+            batch.append(p)
+            total_posts += 1
+            
+            # Écriture par paquets de 400 pour éviter les limites de taille/temps
+            if len(batch) >= 400:
+                client.put_multi(batch)
+                batch = []
+    
+    # Écrire le reste du batch
+    if batch:
+        client.put_multi(batch)
+
     return {
         'users_total': users,
-        'users_created': created_users,
-        'posts_created': created_posts,
+        'posts_per_user': posts_per_user,
+        'total_posts_created': total_posts,
+        'follows_per_user': follows_count,
         'prefix': prefix
     }
 
@@ -151,30 +176,31 @@ def api_timeline():
     })
 
 
-@app.route('/admin/seed', methods=['POST'])
+@app.route('/admin/seed', methods=['GET', 'POST'])
 def admin_seed():
-    """Endpoint pour exécuter un seed serveur-side.
-    Sécurité minimale: en-tête X-Seed-Token ou ?token= doit correspondre à SEED_TOKEN.
-    Paramètres (query string ou form): users, posts, follows_min, follows_max, prefix.
     """
+    Endpoint de seed adapté au benchmark.
+    Paramètres URL: users, posts (par user), follows, prefix.
+    Exemple: /admin/seed?users=1000&posts=50&follows=20&prefix=exp1
+    """
+    # Sécurité simple via variable d'env (optionnelle pour le test)
     expected = os.environ.get('SEED_TOKEN')
-    provided = request.headers.get('X-Seed-Token') or request.args.get('token') or request.form.get('token')
-    if expected and provided != expected:
+    token = request.args.get('token')
+    if expected and token != expected:
         return jsonify({'error': 'forbidden'}), 403
-    def _int(name, default):
-        try:
-            return int(request.values.get(name, default))
-        except ValueError:
-            return default
-    users = _int('users', 5)
-    posts = _int('posts', 30)
-    follows_min = _int('follows_min', 1)
-    follows_max = _int('follows_max', 3)
-    prefix = request.values.get('prefix', 'user')
-    if users <= 0 or posts < 0:
-        return jsonify({'error': 'invalid parameters'}), 400
-    result = seed_data(users=users, posts=posts, follows_min=follows_min, follows_max=follows_max, prefix=prefix)
-    return jsonify({'status': 'ok', **result})
+
+    try:
+        users = int(request.args.get('users', 100))
+        posts = int(request.args.get('posts', 10))     # Posts PAR User
+        follows = int(request.args.get('follows', 5))  # Follows PAR User
+        prefix = request.args.get('prefix', 'u_bench') # Préfixe pour isoler les tests
+    except ValueError:
+        return jsonify({'error': 'invalid params'}), 400
+
+    # Lancer le seed
+    result = seed_data(users=users, posts_per_user=posts, follows_count=follows, prefix=prefix)
+    return jsonify({'status': 'ok', 'details': result})
+
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -187,10 +213,12 @@ def login():
     session['user'] = username
     return redirect(url_for('index'))
 
+
 @app.route('/logout')
 def logout():
     session.pop('user', None)
     return redirect(url_for('index'))
+
 
 @app.route('/post', methods=['POST'])
 def post():
@@ -202,10 +230,11 @@ def post():
     entity.update({
         'author': user,
         'content': content,
-        'created': datastore.helpers.datetime.datetime.utcnow()
+        'created': datetime.utcnow()
     })
     client.put(entity)
     return redirect(url_for('index'))
+
 
 @app.route('/follow', methods=['POST'])
 def follow():
@@ -215,10 +244,20 @@ def follow():
         return redirect(url_for('index'))
     user_key = client.key('User', user)
     user_entity = client.get(user_key)
-    if to_follow not in user_entity['follows']:
-        user_entity['follows'].append(to_follow)
+    if not user_entity:
+         # Si l'user n'existe pas encore (cas rare en prod mais possible ici)
+         user_entity = datastore.Entity(user_key)
+         user_entity['follows'] = []
+
+    current_follows = user_entity.get('follows', [])
+    if to_follow not in current_follows:
+        current_follows.append(to_follow)
+        user_entity['follows'] = current_follows
         client.put(user_entity)
     return redirect(url_for('index'))
 
+
 if __name__ == '__main__':
+    # Note: En production (App Engine), Gunicorn est utilisé, donc ce bloc n'est pas exécuté.
+    # Pour le dev local:
     app.run(host='127.0.0.1', port=8080, debug=True)

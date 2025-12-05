@@ -1,166 +1,95 @@
-# Tiny Instagram (minimal) on Google App Engine
+# Projet Données Massives et Cloud - Benchmark TinyInsta
 
-This repository contains a tiny Instagram-like demo implemented with Flask and Google Cloud Datastore (Firestore in Datastore mode). It is a small, educational project that demonstrates posting, following, and reading a simple timeline.
+Ce dépôt contient le code source de l'application **TinyInsta** ainsi que les scripts et les résultats du benchmark de performance réalisé sur Google Cloud Platform (App Engine + Datastore).
 
-This README describes how to run, seed and test the app, plus notes about GQL queries and common deployment troubleshooting.
+L'objectif est d'analyser l'évolution des performances (temps de réponse de la timeline) en fonction de la charge utilisateurs (concurrence) et de la taille des données (volume de posts et fanout).
 
-## Prerequisites
-- Create a GCP Project:`https://console.cloud.google.com/`
-  - See the prof.
+## 🔗 Liens du Rendu
 
-- Open a cloud shell 
-  - see the prof.
+* **Application Déployée :** https://github.com/aminemrh/massive-gcp-projet
+* **Code Source :** https://github.com/aminemrh/massive-gcp-projet
 
-* Initialize or select your GCP project and create the App Engine application (if not already created):
+## 📂 Structure du Projet
 
-```sh
-gcloud init
-gcloud app create
-```
+Les résultats bruts (CSV) et les graphiques sont situés dans le répertoire `out/`.
 
-- clone the prof github repository : 
-```
-git clone https://github.com/momo54/massive-gcp
-cd massive-gcp
-```
+* `main.py` : Code source de l'application Flask (Backend).
+* `seed.py` : Script de génération de données (peuplement de la base Datastore).
+* `clean.py` : Script utilitaire pour vider la base de données.
+* `benchmark.py` : Script d'automatisation des tests. Il remplace `apache-bench` par une simulation multi-threadée pour garantir que chaque requête simule un utilisateur différent.
+* `out/` : Contient les fichiers `conc.csv`, `post.csv`, `fanout.csv` et les graphiques correspondants.
 
-* Install dependencies
-```sh
-pip install -r requirements.txt
-```
+## 🚀 Installation et Reproduction
 
-* Deploy the app:
+1.  **Prérequis :**
+    * Google Cloud SDK installé.
+    * Python 3 installé avec les librairies : `requests`, `matplotlib`, `pandas`.
 
-```sh
-gcloud app deploy
-```
+2.  **Déploiement sur GCP :**
+    ```bash
+    gcloud app deploy
+    ```
 
-* [OPTIONAL] Index does not matter:
+3.  **Lancer le Benchmark complet :**
+    Ce script nettoie la base, génère les données (seed) pour chaque scénario, lance les tests de charge et génère les graphiques.
+    ```bash
+    python benchmark.py all
+    ```
 
-```sh
-gcloud app deploy index.yaml
-# or
-gcloud datastore indexes create index.yaml
-```
+---
 
-* open the URL address of the you application, create account, post, follow. Does it Works?? If something is wrong where to find the error ?? 
-  * See the prof
+## 📊 Analyse des Résultats
 
+### 1. Passage à l'échelle sur la charge (Concurrence)
 
-* How many servers are working for this app?? How much are you paying for running this app ? What is the cloud model for this app (Iaas, Paas, Saas). What is the Platform in PaaS ??
+**Configuration :** 1000 utilisateurs, 50 posts/user, 20 followers/user.
+**Variable :** Nombre d'utilisateurs simultanés (1 à 1000).
 
-* See the impact in the datastore: do you see your data ?
-  * See the prof
+![Graphique Concurrence](out/conc.png)
+*(Données brutes : `out/conc.csv`)*
 
-* How much are you paying for hosting these data in this store ?? 
-* What is the consistency of this store ?
-* What is the sharding strategy of this store ? How to be sure of that ? 
-* What queries can you write with store (expressivity)
+**Analyse :**
+On observe une augmentation de la latence jusqu'à 100 utilisateurs. Cependant, une **chute drastique du temps de réponse** est visible à 1000 utilisateurs (~200ms).
+Ce comportement paradoxal s'explique par l'**Autoscaling** de Google App Engine. Détectant une surcharge lors des tests intermédiaires, la plateforme a provisionné de nouvelles instances. La charge de 1000 utilisateurs a donc été répartie sur plusieurs serveurs, réduisant la latence perçue, là où une instance unique aurait saturé.
 
-## HTTP Endpoints
+### 2. Passage à l'échelle sur la taille des données (Posts)
 
-- `/` — HTML UI for simple interactions
-- `POST /login` — login with a username (no password)
-- `POST /post` — create a new post (form)
-- `POST /follow` — follow another user (form)
-- `GET /api/timeline?user=<username>&limit=<n>` — JSON timeline for a user (default limit 20)
-- `POST /admin/seed` — server-side seed (requires `SEED_TOKEN` via header `X-Seed-Token` or `token` param)
+**Configuration :** 50 requêtes simultanées, 20 followers/user.
+**Variable :** Nombre de posts par utilisateur (10, 100, 1000).
 
-Example server-side seed call:
+![Graphique Posts](out/post.png)
+*(Données brutes : `out/post.csv`)*
 
-```sh
-curl -X POST \
-  -H "X-Seed-Token: change-me-seed-token" \
-  "https://<YOUR_APP>.appspot.com/admin/seed?users=8&posts=100&follows_min=1&follows_max=4&prefix=load"
-```
+**Analyse :**
+Les performances restent globalement stables et acceptables (augmentation linéaire faible) même lorsque le volume de posts est multiplié par 100.
+Cela démontre l'efficacité des **index de Google Datastore**. La requête de timeline récupérant les "20 derniers posts", le volume total de l'historique n'impacte que très peu les performances de lecture.
 
-## Access the backend from the CLI
+### 3. Passage à l'échelle sur le Fanout (Followers)
 
-The JSON endpoint `GET /api/timeline?user=<username>&limit=20` is suitable for basic load experiments.
+**Configuration :** 50 requêtes simultanées, 100 posts/user.
+**Variable :** Nombre de followers par utilisateur (10, 50, 100).
 
-- Run locally against the dev server:
+![Graphique Fanout](out/fanout.png)
+*(Données brutes : `out/fanout.csv`)*
 
-```sh
-ab -n 200 -c 20 "http://127.0.0.1:8080/api/timeline?user=demo1&limit=20"
-```
+**Analyse :**
+C'est le point critique de l'application. On observe une explosion du temps de réponse (> 10 secondes) et l'apparition d'erreurs (**FAILED=1**) à 100 followers.
+La cause est la limitation de l'opérateur `IN` du Datastore (limité à 30 valeurs). Au-delà, l'application exécute séquentiellement une requête par ami suivi. Avec 50 utilisateurs simultanés suivant 100 personnes, le serveur tente de gérer des milliers de requêtes en cascade, provoquant saturation et timeouts. L'architecture "Query-on-read" n'est pas adaptée ici.
 
-- Run against the deployed app (no cookie):
+---
 
-```sh
-ab -n 500 -c 50 "https://<YOUR_APP>.appspot.com/api/timeline?user=demo1&limit=20"
-```
+## 🏁 Conclusion : Est-ce que ça passe à l'échelle ?
 
-- Optional: include a session cookie if you want to test authenticated flows (get `session` cookie from your browser devtools):
+L'expérience répond à la question "Does it scale ?" par la négative pour l'architecture globale, avec des nuances importantes :
 
-```sh
-AB_COOKIE="session=<VALUE>"
-ab -n 500 -c 50 -H "Cookie: $AB_COOKIE" "https://<YOUR_APP>.appspot.com/api/timeline?limit=20"
-```
+1.  **Stockage (✅ OUI) :** L'application passe très bien à l'échelle sur le volume de données grâce à la nature NoSQL et aux index de Datastore.
+2.  **Charge (⚠️ OUI, financièrement) :** L'application gère la charge massive (1000 utilisateurs) uniquement grâce à l'**Autoscaling** du Cloud (ajout de machines), et non par l'efficacité du code.
+3.  **Logique Sociale (❌ NON) :** L'application échoue à passer à l'échelle sur le "Fanout". L'architecture naïve **"Pull" (Query-on-Read)** sature la base de données (complexité O(N)) dès qu'un utilisateur suit plus de 30 personnes.
 
-Interpreting common metrics:
-- `Requests per second` — throughput
-- `Time per request` — latency
-- `Failed requests` — should remain near 0 for a healthy run
+**Recommandation :** Pour supporter un vrai réseau social, il faudrait migrer vers une architecture **"Push" (Fanout-on-Write)**, où les timelines sont pré-calculées lors de l'écriture d'un post, rendant la lecture instantanée (O(1)).
 
-## GQL & Datastore notes
+---
 
-The timeline query used by the app is roughly:
+## 👤 Auteur
 
-```sql
-SELECT * FROM Post WHERE author IN @authors ORDER BY created DESC
-```
-
-Notes:
-- `IN` queries are conceptually implemented as a union of per-author scans followed by a k-way merge ordered by `created DESC`.
-- The repository includes `index.yaml` with a composite index (author + created desc), which is required for efficient execution of the timeline query.
-- Writes use the Datastore entity API; GQL is used for convenient reads only.
-
-Limitations and trade-offs:
-- `IN` with many values increases work and latency because it becomes multiple queries merged server-side.
-- Global queries are eventually consistent; only key lookups and ancestor queries are strongly consistent. See `NOTES.md` for more detail.
-
-## Troubleshooting: Cloud Build / staging bucket error
-
-If you encounter an error like:
-
-```
-Failed to create cloud build: ... invalid bucket "staging.<PROJECT>.appspot.com"; service account ... does not have access
-```
-
-Check the following:
-
-1. Required services are enabled:
-
-```sh
-gcloud services enable appengine.googleapis.com cloudbuild.googleapis.com iam.googleapis.com storage.googleapis.com
-```
-
-2. Ensure the App Engine service account has sufficient permissions on the staging bucket. For example, grant storage admin at project level (adjust to least privilege required):
-
-```sh
-PROJECT_ID="<YOUR_PROJECT>"
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com" \
-  --role="roles/storage.admin"
-```
-
-3. If the staging bucket is missing, create it and grant the service account object admin on the bucket:
-
-```sh
-gsutil mb -p "$PROJECT_ID" -l europe-west1 "gs://staging.${PROJECT_ID}.appspot.com"
-gsutil iam ch serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com:objectAdmin "gs://staging.${PROJECT_ID}.appspot.com"
-```
-
-Index deployment (if GCP prompts for missing indexes):
-
-```sh
-gcloud datastore indexes create index.yaml || gcloud app deploy index.yaml
-```
-
-## Notes on consistency, partitioning and CAP
-See `NOTES.md` for a concise explanation of Datastore's partitioning (range partitioning with dynamic splits), replication, and its consistency model (generally AP for global queries; strong consistency for key lookups and ancestor queries).
-
-## License
-MIT
-
-```
+Projet réalisé dans le cadre du cours "Données Massives et Cloud".
